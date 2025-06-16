@@ -1,0 +1,189 @@
+#!/bin/bash
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+# Check if running as root
+if [ "$(id -u)" -ne 0 ]; then
+    echo -e "${RED}Error: Please run as root or use sudo${NC}"
+    exit 1
+fi
+
+# Function to check TPM unlock status
+check_tpm_status() {
+    local LUKS_UUID=$1
+    local status=0  # 0=disabled, 1=enabled
+    
+    # Check if TPM is enrolled in LUKS
+    if systemd-cryptenroll /dev/disk/by-uuid/"${LUKS_UUID}" | grep -q "tpm2"; then
+        status=1
+    fi
+    
+    # Check boot parameters
+    if grubby --info=ALL | grep -q "rd.luks.options=tpm2-device=/dev/tpmrm0"; then
+        status=1
+    fi
+    
+    # Check crypttab
+    if grep -q "tpm2-device=/dev/tpmrm0" /etc/crypttab; then
+        status=1
+    fi
+    
+    echo $status
+}
+
+# Header
+echo -e "${BLUE}-------------------------------------------${NC}\n"
+echo -e "${CYAN}=== TPM2 LUKS Unlock Configuration Tool ===${NC}"
+echo -e "${BLUE}-------------------------------------------${NC}\n"
+
+# Get LUKS UUID
+echo -e "${YELLOW}[INFO] Getting LUKS UUID...${NC}"
+LUKS_UUID="$(grubby --target=cryptodisk_uuid / 2>/dev/null || grub2-probe --target=cryptodisk_uuid /)"
+if [ -z "$LUKS_UUID" ]; then
+    echo -e "${RED}Error: Could not determine LUKS UUID${NC}"
+    exit 1
+fi
+echo -e "${GREEN}Found LUKS UUID: ${LUKS_UUID}${NC}\n"
+
+# Check current status
+CURRENT_STATUS=$(check_tpm_status "$LUKS_UUID")
+
+if [ "$CURRENT_STATUS" -eq 1 ]; then
+    echo -e "${GREEN}Current status: TPM unlock is ENABLED${NC}"
+    echo -e "${CYAN}Do you want to:${NC}"
+    select action in "Disable TPM unlock" "Keep enabled and exit"; do
+        case $action in
+            "Disable TPM unlock" ) ENABLE_TPM=false; break;;
+            "Keep enabled and exit" ) exit 0;;
+        esac
+    done
+else
+    echo -e "${YELLOW}Current status: TPM unlock is DISABLED${NC}"
+    echo -e "${CYAN}Do you want to:${NC}"
+    select action in "Enable TPM unlock" "Keep disabled and exit"; do
+        case $action in
+            "Enable TPM unlock" ) ENABLE_TPM=true; break;;
+            "Keep disabled and exit" ) exit 0;;
+        esac
+    done
+    
+    if $ENABLE_TPM; then
+        # Verify Secure Boot is active
+        echo -e "\n${YELLOW}[INFO] Checking Secure Boot status...${NC}"
+        if ! mokutil --sb-state | grep -q "SecureBoot enabled"; then
+            echo -e "${RED}Error: Secure Boot is not enabled. Please enable it in your BIOS first.${NC}"
+            exit 1
+        fi
+
+        # Check for TPM support
+        echo -e "${YELLOW}[INFO] Checking TPM2 device...${NC}"
+        if ! systemd-cryptenroll --tpm2-device=list | grep -q "/dev/tpmrm0"; then
+            echo -e "${RED}Error: No TPM2 device found. Is TPM enabled in BIOS?${NC}"
+            exit 1
+        fi
+    fi
+fi
+
+if $ENABLE_TPM; then
+    echo -e "\n${BLUE}=== Enabling TPM2 LUKS Unlock ===${NC}"
+    
+    # Enroll TPM2 device
+    echo -e "${YELLOW}[INFO] Enrolling TPM2 device...${NC}"
+    echo -e "${CYAN}You will be prompted for your LUKS passphrase...${NC}"
+    if ! systemd-cryptenroll \
+        --wipe-slot=tpm2 \
+        --tpm2-device=/dev/tpmrm0 \
+        /dev/disk/by-uuid/"${LUKS_UUID}"; then
+        echo -e "${RED}Error: Failed to enroll TPM2 device${NC}"
+        exit 1
+    fi
+
+    # Confirm TPM key slot
+    echo -e "\n${YELLOW}[INFO] Confirming TPM key slot...${NC}"
+    systemd-cryptenroll /dev/disk/by-uuid/"${LUKS_UUID}"
+
+    # Update kernel boot options
+    echo -e "\n${YELLOW}[INFO] Updating kernel boot options...${NC}"
+    if ! grubby --update-kernel=ALL \
+        --args="rd.luks.options=tpm2-device=/dev/tpmrm0"; then
+        echo -e "${RED}Error: Failed to update boot options${NC}"
+        exit 1
+    fi
+
+    # Update /etc/crypttab
+    echo -e "\n${YELLOW}[INFO] Updating /etc/crypttab...${NC}"
+    echo "luks-${LUKS_UUID} UUID=${LUKS_UUID} none tpm2-device=/dev/tpmrm0" > /etc/crypttab
+
+    # Enable TPM module in dracut
+    echo -e "\n${YELLOW}[INFO] Configuring dracut for TPM2...${NC}"
+    echo 'add_dracutmodules+=" tpm2-tss "' > /etc/dracut.conf.d/tpm2.conf
+
+    echo -e "\n${GREEN}TPM2 disk unlock setup complete!${NC}"
+else
+    echo -e "\n${BLUE}=== Disabling TPM2 LUKS Unlock ===${NC}"
+    
+    # Remove TPM2 key slot
+    echo -e "${YELLOW}[INFO] Removing TPM2 key slot...${NC}"
+    if ! systemd-cryptenroll --wipe-slot=tpm2 /dev/disk/by-uuid/"${LUKS_UUID}"; then
+        echo -e "${YELLOW}Warning: Failed to remove TPM2 key slot${NC}"
+        echo -e "${CYAN}This might be normal if TPM2 wasn't enrolled${NC}"
+    fi
+
+    # Remove TPM2 device from kernel boot options
+    echo -e "\n${YELLOW}[INFO] Removing TPM2 from kernel boot options...${NC}"
+    grubby --update-kernel=ALL --remove-args="rd.luks.options=tpm2-device=/dev/tpmrm0"
+
+    # Remove TPM2 from crypttab
+    echo -e "\n${YELLOW}[INFO] Clearing /etc/crypttab...${NC}"
+    if grep -q "tpm2-device=/dev/tpmrm0" /etc/crypttab; then
+        sed -i '/tpm2-device=\/dev\/tpmrm0/d' /etc/crypttab
+    else
+        echo -e "${CYAN}No TPM2 entries found in /etc/crypttab${NC}"
+    fi
+
+    # Remove dracut TPM2 configuration
+    echo -e "\n${YELLOW}[INFO] Removing dracut TPM2 configuration...${NC}"
+    rm -f /etc/dracut.conf.d/tpm2.conf
+
+    echo -e "\n${GREEN}TPM2 disk unlock has been disabled successfully!${NC}"
+fi
+
+# Common steps for both enable and disable
+echo -e "\n${BLUE}=== Finalizing Configuration ===${NC}"
+
+# Regenerate GRUB config
+echo -e "${YELLOW}[INFO] Regenerating GRUB config...${NC}"
+if ! grub2-mkconfig -o /boot/grub2/grub.cfg; then
+    echo -e "${RED}Error: Failed to regenerate GRUB config${NC}"
+    exit 1
+fi
+
+# Rebuild initramfs
+echo -e "\n${YELLOW}[INFO] Rebuilding initramfs...${NC}"
+if ! dracut -vf; then
+    echo -e "${RED}Error: Failed to rebuild initramfs${NC}"
+    exit 1
+fi
+
+# Ask before rebooting
+echo -e "\n${BLUE}=== Reboot Instructions ===${NC}"
+if $ENABLE_TPM; then
+    echo -e "${GREEN}You should only be prompted for the LUKS passphrase once before GRUB appears.${NC}"
+else
+    echo -e "${YELLOW}You will now be prompted for your LUKS passphrase twice (before and after GRUB).${NC}"
+fi
+
+read -p "$(echo -e ${CYAN}"Do you want to reboot now? (y/N) "${NC})" -n 1 -r
+echo
+if [[ $REPLY =~ ^[Yy]$ ]]; then
+    echo -e "\n${YELLOW}Rebooting system...${NC}"
+    reboot
+else
+    echo -e "\n${YELLOW}Reboot canceled. Remember to reboot for changes to take effect.${NC}"
+fi
