@@ -1,5 +1,5 @@
 # setup-tpm-unlock
-A bash script to enable or disable TPM2 LUKS unlock for Fedora.
+A bash script to enable or disable TPM2 LUKS unlock for Fedora, made for personal use.
 
 ## Installation 
 - Place the script inside the `~/local/bin/` directory. Make sure the `PATH` is in your environmental variables.
